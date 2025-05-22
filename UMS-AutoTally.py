@@ -5,24 +5,34 @@ import hmac
 import hashlib
 import base64
 import urllib.parse
-from PIL import Image, ImageEnhance # Modified import
-import pytesseract
+from PIL import Image, ImageEnhance
 import requests
 from datetime import datetime
 import shutil
 import re
+import easyocr  # 替换 pytesseract
 
 # 配置
 ADB_PATH = "adb"  # ADB 命令路径，如果未添加到环境变量，改为完整路径
-DEVICE_ID = "192.168.177.244:5555"  # 模拟器设备ID，通过 adb devices 获取
+DEVICE_ID = ""  # 模拟器设备ID，通过 adb devices 获取
 APP_PACKAGE = "com.chinaums.onlineservice"  # 银联商务包名
 APP_ACTIVITY = "com.chinaums.onlineservice.ui.index.SplashActivity"  # 主活动名，需通过 adb logcat 确认
-DINGTALK_WEBHOOK = "https://oapi.dingtalk.com/robot/send?access_token=cc17b6fccc765c8c553c3ab1e110498c25fd75ee73cbbd9385846589885b47f1"  # 钉钉Webhook地址
-DINGTALK_SECRET = "SECe835d44b44653c7a6eaf0ce8f6a9cdb108eb16128c796aa5969b99fec28a7688"  # 钉钉机器人密钥，用于签名认证
+DINGTALK_WEBHOOK = ""  # 钉钉Webhook地址
+DINGTALK_SECRET = ""  # 钉钉机器人密钥，用于签名认证
 SCREENSHOT_PATH = "temp_screenshot.png"
 CROPPED_PATH = "temp_cropped.png"
 SCREENSHOT_DIR = "screenshots"
 PHONE_SCREENSHOT_DIR = "/storage/emulated/0/ums/screenshot"  # 手机上截图保存路径
+
+# 初始化 EasyOCR 阅读器 
+reader = None
+def get_ocr_reader():
+    global reader
+    if reader is None:
+        print("初始化 EasyOCR 引擎...")
+        # 只使用英文模型以加快识别速度，因为我们只需要识别数字
+        reader = easyocr.Reader(['en'], gpu=False)
+    return reader
 
 # 二维码名称与相册坐标映射
 QR_CODES = [
@@ -117,58 +127,50 @@ def take_screenshot(save_path=None, name=None):
     
     return True
 
-# OCR识别金额，调整裁剪区域
+# 使用 EasyOCR 识别金额
 def recognize_amount():
     print("识别金额中...")
     try:
         img = Image.open(SCREENSHOT_PATH)
         # 裁剪区域为 (512, 1058, 921, 1165)
         cropped = img.crop((512, 1058, 921, 1165))
-        cropped = cropped.convert('L')  # 转为灰度图以提高识别率
-
+        
         # 增强对比度
         enhancer = ImageEnhance.Contrast(cropped)
-        cropped_enhanced = enhancer.enhance(2.0)  # 增强因子为2.0，可以根据实际效果调整
-
-        # Binarization: 将图像转为黑白。阈值 (128) 可能需要根据图像特点调整。
-        # 常见调整范围 100-180。
-        threshold = 128
-        cropped_binarized = cropped_enhanced.point(lambda x: 0 if x < threshold else 255, '1')
-
-        cropped_binarized.save(CROPPED_PATH) # 保存处理后的图像，方便调试
-
-        # 更新 Tesseract 配置:
-        # --psm 7: 将图像视为单个文本行。
-        # --oem 1: 仅使用 LSTM OCR 引擎。
-        # -c tessedit_char_whitelist=0123456789.: 字符白名单，仅识别数字和点。
-        config = '--psm 7 --oem 1 -c tessedit_char_whitelist=0123456789.'
-        text = pytesseract.image_to_string(cropped_binarized, lang='eng', config=config)
+        cropped = enhancer.enhance(2.0)
         
-        print(f"OCR结果 (Pytesseract config: {config}): {text}")
+        # 保存裁剪后的图像以便调试
+        cropped.save(CROPPED_PATH)
         
-        # 对常见的OCR错误进行简单修正 (例如: O -> 0, S -> 5, l -> 1, B -> 8)
-        text = text.strip()
-        text = text.replace('O', '0').replace('S', '5').replace('s', '5')\
-                   .replace('l', '1').replace('I', '1').replace('B', '8').replace(' ', '') # 移除空格
-        print(f"OCR结果 (手动修正后): {text}")
-
-        match = re.search(r'(\d+\.?\d*)', text)
-        if match:
-            amount_str = match.group(1)
-            # 处理OCR可能产生的无效数字，例如单独一个点，或者以点结尾但无后续数字
-            if amount_str == '.':
-                print(f"提取金额无效，仅为 '.'")
-                return 0.0
-            if amount_str.endswith('.') and not any(char.isdigit() for char in amount_str[amount_str.rfind('.')+1:]):
-                 amount_str = amount_str[:-1] # 如果以点结尾且点后无数字，则移除点
+        # 使用 EasyOCR 识别文本
+        reader = get_ocr_reader()
+        results = reader.readtext(CROPPED_PATH)
+        print(f"EasyOCR 结果: {results}")
+        
+        # 提取识别结果
+        if results:
+            # EasyOCR 返回格式是：[(bbox, text, probability), ...]
+            all_text = ' '.join([result[1] for result in results])
+            print(f"合并文本: {all_text}")
             
-            if amount_str and amount_str != '.': # 再次检查，确保不为空或仅为点
-                return float(amount_str)
+            # 清理文本，只保留数字和点
+            cleaned_text = ''.join([c for c in all_text if c.isdigit() or c == '.'])
+            print(f"清理后文本: {cleaned_text}")
+            
+            # 使用正则表达式提取数字
+            match = re.search(r'(\d+\.?\d*)', cleaned_text)
+            if match:
+                amount_str = match.group(1)
+                # 处理提取到的文本
+                if amount_str and amount_str != '.':
+                    try:
+                        return float(amount_str)
+                    except ValueError:
+                        print(f"转换为浮点数失败: {amount_str}")
             else:
-                print(f"提取金额失败，修正后金额字符串为空或无效: '{amount_str}'")
+                print(f"未从清理后文本中提取到数字: {cleaned_text}")
         else:
-            print(f"未从OCR结果中匹配到金额: '{text}'")
-
+            print("EasyOCR 未识别到任何文本")
     except Exception as e:
         print(f"金额识别过程中发生错误: {str(e)}")
     return 0.0
